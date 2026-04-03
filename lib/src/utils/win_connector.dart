@@ -9,17 +9,22 @@ class WinConnector {
   int _requestId = 0;
   StreamSubscription? _stdoutSubscription;
   StreamSubscription? _stderrSubscription;
+  StreamSubscription? _exitSubscription;
   Process? _bleServer;
   final _responseStreamController = StreamController.broadcast();
+  final BytesBuilder _stdoutBuffer = BytesBuilder(copy: false);
+  Future<void> _pendingWrite = Future.value();
+  bool _isClosing = false;
 
   Future<void> initialize({
     Function(dynamic)? onData,
     required String serverPath,
   }) async {
+    _isClosing = false;
     File bleFile = File(serverPath);
     _bleServer = await Process.start(bleFile.path, []);
     _stdoutSubscription = _bleServer?.stdout.listen((event) {
-      var listData = _dataParser(event);
+      final listData = _dataParser(event);
       for (var data in listData) {
         _handleResponse(data);
         onData?.call(data);
@@ -28,6 +33,16 @@ class WinConnector {
 
     _stderrSubscription = _bleServer?.stderr.listen((event) {
       throw String.fromCharCodes(event);
+    });
+
+    _exitSubscription = _bleServer?.exitCode.asStream().listen((exitCode) {
+      if (exitCode != 0) {
+        _responseStreamController.add({
+          "id": -1,
+          "result": null,
+          "error": "BLE helper exited unexpectedly with code $exitCode",
+        });
+      }
     });
   }
 
@@ -39,24 +54,30 @@ class WinConnector {
     Map<String, dynamic> result = args ?? {};
     // If we don't need to wait for the result, just send the message and return
     if (!waitForResult) {
-      _sendMessage(method: method, args: result);
+      await _sendMessage(method: method, args: result);
       return;
     }
     // If we need to wait for the result, we need to generate a unique ID
     int uniqID = _requestId++;
     result["_id"] = uniqID;
-    _sendMessage(method: method, args: result);
-    var data = await _responseStreamController.stream.firstWhere(
+    final responseFuture = _responseStreamController.stream.firstWhere(
       (element) => element["id"] == uniqID,
     );
+    await _sendMessage(method: method, args: result);
+    var data = await responseFuture;
     if (data["error"] != null) throw data["error"];
     return data['result'];
   }
 
   void dispose() {
+    _isClosing = true;
+    _pendingWrite = Future.value();
+    _exitSubscription?.cancel();
     _stderrSubscription?.cancel();
     _stdoutSubscription?.cancel();
     _bleServer?.kill();
+    _bleServer = null;
+    _stdoutBuffer.clear();
   }
 
   void _handleResponse(response) {
@@ -65,23 +86,46 @@ class WinConnector {
         _responseStreamController.add({
           "id": response["_id"],
           "result": response["result"],
-          "error": response["error"]
+          "error": response["error"],
         });
       }
     } catch (_) {}
   }
 
-  void _sendMessage({
+  Future<void> _sendMessage({
     required String method,
     Map<String, dynamic>? args,
-  }) {
+  }) async {
+    if (_isClosing) return;
+
+    final bleServer = _bleServer;
+    if (bleServer == null) return;
+
     Map<String, dynamic> result = {"cmd": method};
     if (args != null) result.addAll(args);
-    String data = json.encode(result);
-    List<int> dataBufInt = utf8.encode(data);
-    List<int> lenBufInt = _createUInt32LE(dataBufInt.length);
-    _bleServer?.stdin.add(lenBufInt);
-    _bleServer?.stdin.add(dataBufInt);
+    final data = json.encode(result);
+    final dataBufInt = utf8.encode(data);
+    final lenBufInt = _createUInt32LE(dataBufInt.length);
+
+    Future<void> writeOperation() async {
+      if (_isClosing || !identical(_bleServer, bleServer)) return;
+
+      try {
+        await bleServer.stdin.addStream(
+          Stream<List<int>>.fromIterable([lenBufInt, dataBufInt]),
+        );
+      } on SocketException catch (e) {
+        final isPipeClosing = e.osError?.errorCode == 232;
+        if (_isClosing && isPipeClosing) {
+          return;
+        }
+        rethrow;
+      }
+    }
+
+    final queuedWrite = _pendingWrite.then((_) => writeOperation());
+    _pendingWrite = queuedWrite.catchError((_) {});
+    await queuedWrite;
   }
 
   List<int> _createUInt32LE(int value) {
@@ -92,21 +136,43 @@ class WinConnector {
     return result;
   }
 
-  List<dynamic> _dataParser(event) {
-    var data = String.fromCharCodes(event);
-    List<dynamic> list = [];
+  List<dynamic> _dataParser(List<int> event) {
+    _stdoutBuffer.add(event);
+
+    final buffered = _stdoutBuffer.takeBytes();
+    final input = Uint8List.fromList(buffered);
+    final output = <dynamic>[];
     var cursor = 0;
-    while (cursor < data.length) {
-      var length = _fromBytesToInt32(event[cursor + 0], event[cursor + 1],
-          event[cursor + 2], event[cursor + 3]);
-      cursor += 4;
-      String payload = data.substring(cursor, cursor + length);
-      cursor += length;
-      var jsonData = json.decode(payload);
-      list.add(jsonData);
+
+    while (cursor + 4 <= input.length) {
+      final length = _fromBytesToInt32(
+        input[cursor + 0],
+        input[cursor + 1],
+        input[cursor + 2],
+        input[cursor + 3],
+      );
+
+      if (length < 0) {
+        throw const FormatException('Negative BLE helper payload length');
+      }
+
+      final frameStart = cursor + 4;
+      final frameEnd = frameStart + length;
+      if (frameEnd > input.length) {
+        break;
+      }
+
+      final payloadBytes = input.sublist(frameStart, frameEnd);
+      final payload = utf8.decode(payloadBytes);
+      output.add(json.decode(payload));
+      cursor = frameEnd;
     }
-    if (cursor != data.length) return [];
-    return list;
+
+    if (cursor < input.length) {
+      _stdoutBuffer.add(input.sublist(cursor));
+    }
+
+    return output;
   }
 
   int _fromBytesToInt32(int b3, int b2, int b1, int b0) {
