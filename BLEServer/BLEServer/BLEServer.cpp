@@ -311,7 +311,7 @@ Concurrency::task<IJsonValue ^> disconnectRequest(JsonObject ^ command)
 
 	devices->Remove(deviceId);
 
-	return Concurrency::task_from_result<IJsonValue ^>(JsonValue::CreateNullValue());
+	co_return JsonValue::CreateNullValue();
 }
 
 concurrency::task<Bluetooth::GenericAttributeProfile::GattDeviceServicesResult ^> findServices(JsonObject ^ command)
