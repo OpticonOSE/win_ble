@@ -38,6 +38,95 @@ auto characteristicsListenerMap = ref new Collections::Map<String ^, Windows::Fo
 auto characteristicsSubscriptionMap = ref new Collections::Map<String ^, JsonValue ^>();
 auto deviceConnectionStatusListenerMap = ref new Collections::Map<String ^, Windows::Foundation::EventRegistrationToken>();
 
+void cleanupDisconnectedDevice(String ^ deviceId, Bluetooth::BluetoothLEDevice ^ device)
+{
+	auto newCharacteristicsMap = ref new Collections::Map<String ^, Bluetooth::GenericAttributeProfile::GattCharacteristic ^>();
+	for (auto pair : characteristicsMap)
+	{
+		bool removed = true;
+		auto characteristic = pair->Value;
+		try
+		{
+			auto service = characteristic->Service;
+			if (service->Device->DeviceId->Equals(deviceId))
+			{
+				if (characteristicsListenerMap->HasKey(pair->Key))
+				{
+					try
+					{
+						characteristic->ValueChanged -= characteristicsListenerMap->Lookup(pair->Key);
+					}
+					catch (...)
+					{
+					}
+				}
+
+				try
+				{
+					delete characteristic;
+				}
+				catch (...)
+				{
+				}
+
+				try
+				{
+					delete service;
+				}
+				catch (...)
+				{
+				}
+			}
+			else
+			{
+				newCharacteristicsMap->Insert(pair->Key, pair->Value);
+				removed = false;
+			}
+		}
+		catch (...)
+		{
+		}
+
+		if (removed)
+		{
+			if (characteristicsListenerMap->HasKey(pair->Key))
+			{
+				characteristicsListenerMap->Remove(pair->Key);
+			}
+			if (characteristicsSubscriptionMap->HasKey(pair->Key))
+			{
+				characteristicsSubscriptionMap->Remove(pair->Key);
+			}
+		}
+	}
+	characteristicsMap = newCharacteristicsMap;
+
+	if (deviceConnectionStatusListenerMap->HasKey(deviceId))
+	{
+		try
+		{
+			device->ConnectionStatusChanged -= deviceConnectionStatusListenerMap->Lookup(deviceId);
+		}
+		catch (...)
+		{
+		}
+		deviceConnectionStatusListenerMap->Remove(deviceId);
+	}
+
+	try
+	{
+		delete device;
+	}
+	catch (...)
+	{
+	}
+
+	if (devices->HasKey(deviceId))
+	{
+		devices->Remove(deviceId);
+	}
+}
+
 std::wstring formatBluetoothAddress(unsigned long long BluetoothAddress)
 {
 	std::wostringstream ret;
@@ -115,15 +204,12 @@ concurrency::task<IJsonValue ^> connectRequest(JsonObject ^ command)
 		{
 			if (device->ConnectionStatus == Bluetooth::BluetoothConnectionStatus::Disconnected)
 			{
+				auto deviceId = device->DeviceId;
 				JsonObject ^ msg = ref new JsonObject();
 				msg->Insert("_type", JsonValue::CreateStringValue("disconnectEvent"));
-				msg->Insert("device", JsonValue::CreateStringValue(device->DeviceId));
+				msg->Insert("device", JsonValue::CreateStringValue(deviceId));
 				writeObject(msg);
-				if (deviceConnectionStatusListenerMap->HasKey(device->DeviceId))
-				{
-					deviceConnectionStatusListenerMap->Remove(device->DeviceId);
-				}
-				devices->Remove(device->DeviceId);
+				cleanupDisconnectedDevice(deviceId, device);
 			}
 		});
 	deviceConnectionStatusListenerMap->Insert(device->DeviceId, connectionStatusToken);
@@ -299,6 +385,20 @@ Concurrency::task<IJsonValue ^> disconnectRequest(JsonObject ^ command)
 			// Ignore connection status handler removal failures during disconnect cleanup.
 		}
 		deviceConnectionStatusListenerMap->Remove(deviceId);
+	}
+
+	try
+	{
+		auto session = co_await Bluetooth::GenericAttributeProfile::GattSession::FromDeviceIdAsync(device->BluetoothDeviceId);
+		if (session != nullptr)
+		{
+			session->MaintainConnection = false;
+			delete session;
+		}
+	}
+	catch (...)
+	{
+		// Ignore session teardown failures during disconnect cleanup.
 	}
 
 	try
@@ -879,7 +979,7 @@ int main(Array<String ^> ^ args)
 				String ^ jsonStr = ref new String(convert.from_bytes(msgBuf, msgBuf + len).c_str());
 				delete[] msgBuf;
 				JsonObject ^ json = JsonObject::Parse(jsonStr);
-				processCommand(json);
+				processCommand(json).wait();
 			}
 		}
 	}

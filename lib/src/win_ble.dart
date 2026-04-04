@@ -178,6 +178,9 @@ class WinBle {
         "connected": false,
       });
       WinHelper.deviceMap[address] = null;
+      WinHelper.subscriptions.removeWhere(
+        (_, value) => value["address"] == address,
+      );
     } catch (e) {
       if (e.toString().contains("not found")) {
         // ignore for now
