@@ -19,7 +19,6 @@
 #include <iomanip>
 #include <experimental/resumable>
 #include <pplawait.h>
-#include <cvt/wstring>
 #include <codecvt>
 #include <stdio.h>
 #include <fcntl.h>
@@ -83,7 +82,7 @@ void writeObject(JsonObject ^ jsonObject)
 {
 	String ^ jsonString = jsonObject->Stringify();
 
-	stdext::cvt::wstring_convert<std::codecvt_utf8<wchar_t>> convert;
+	std::wstring_convert<std::codecvt_utf8<wchar_t>> convert;
 	std::string stringUtf8 = convert.to_bytes(jsonString->Data());
 
 	auto len = stringUtf8.length();
@@ -799,7 +798,7 @@ int main(Array<String ^> ^ args)
 		return -1;
 	}
 
-	stdext::cvt::wstring_convert<std::codecvt_utf8<wchar_t>> convert;
+	std::wstring_convert<std::codecvt_utf8<wchar_t>> convert;
 	try
 	{
 		while (!std::cin.eof())
