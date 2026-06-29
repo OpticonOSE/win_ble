@@ -25,3 +25,4 @@ flutter:
   uses-material-design: true
   assets:
     - packages/win_ble/assets/BLEServer.exe
+    - packages/win_ble/assets/BLEServer.arm64.exe
