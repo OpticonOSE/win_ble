@@ -160,7 +160,13 @@ class WinBle {
       // we have to perform an operation on device in order to make a connection
       final services = await discoverServices(address, forceRefresh: true);
       if (services.isEmpty) {
-        throw StateError("Connected BLE device exposed no GATT services");
+        // Some low-power peripherals expose their GATT table shortly after the
+        // native connection is established. Keep the device registered so the
+        // caller can retry discovery on the same connection.
+        WinHelper.printLog(
+          "Initial service discovery for $address returned no services; "
+          "leaving the connection available for a retry",
+        );
       }
 
       _connectionStreamController.add({

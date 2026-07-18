@@ -1,5 +1,8 @@
 ## Unreleased
 
+- Keep a successfully opened native connection available when its initial GATT
+  service discovery is empty, allowing callers to retry transient discovery.
+
 - Propagate connection failures and clean up partial native device state.
 - Make disconnect cleanup idempotent when a device was not registered.
 
