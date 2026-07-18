@@ -1,3 +1,8 @@
+## Unreleased
+
+- Propagate connection failures and clean up partial native device state.
+- Make disconnect cleanup idempotent when a device was not registered.
+
 ## 1.1.1
 
 - Replace `win32` with `path_provider` for getting ble_server path [#38](https://github.com/rohitsangwan01/win_ble/pull/38)

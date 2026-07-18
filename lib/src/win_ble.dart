@@ -149,19 +149,47 @@ class WinBle {
   /// false if disconnected
   static Future<void> connect(String address) async {
     try {
-      var result = await _channel.invokeMethod("connect", args: {
+      final result = await _channel.invokeMethod("connect", args: {
         "address": address.replaceAll(":", ""),
       });
+      if (result == null || result.toString().isEmpty) {
+        throw StateError("Windows did not return a BLE device identifier");
+      }
+
       WinHelper.deviceMap[address] = result;
       // we have to perform an operation on device in order to make a connection
-      var services = await discoverServices(address, forceRefresh: true);
-      // A temporary way of detecting connection : if services are empty then connection is failed
-      bool connectionFailed = services.isEmpty;
+      final services = await discoverServices(address, forceRefresh: true);
+      if (services.isEmpty) {
+        throw StateError("Connected BLE device exposed no GATT services");
+      }
+
       _connectionStreamController.add({
         "device": address,
-        "connected": !connectionFailed,
+        "connected": true,
       });
-    } catch (e) {
+    } catch (error) {
+      final nativeDevice = WinHelper.deviceMap[address];
+      if (nativeDevice != null) {
+        try {
+          await _channel.invokeMethod("disconnect", args: {
+            "device": nativeDevice,
+          }).timeout(const Duration(seconds: 5));
+        } catch (cleanupError) {
+          WinHelper.printLog(
+            "Failed to clean up connection for $address: $cleanupError",
+          );
+        }
+      }
+
+      WinHelper.deviceMap.remove(address);
+      WinHelper.subscriptions.removeWhere(
+        (_, value) => value["address"] == address,
+      );
+      _connectionStreamController.add({
+        "device": address,
+        "connected": false,
+      });
+
       rethrow;
     }
   }
@@ -170,23 +198,23 @@ class WinBle {
   /// and also ignore if that device is already disconnected
   static Future<void> disconnect(address) async {
     try {
-      await _channel.invokeMethod("disconnect", args: {
-        "device": WinHelper.getDeviceFromAddress(address),
-      });
+      final nativeDevice = WinHelper.deviceMap[address];
+      if (nativeDevice != null) {
+        await _channel.invokeMethod("disconnect", args: {
+          "device": nativeDevice,
+        });
+      }
+    } catch (e) {
+      if (!e.toString().contains("not found")) rethrow;
+    } finally {
       _connectionStreamController.add({
         "device": address,
         "connected": false,
       });
-      WinHelper.deviceMap[address] = null;
+      WinHelper.deviceMap.remove(address);
       WinHelper.subscriptions.removeWhere(
         (_, value) => value["address"] == address,
       );
-    } catch (e) {
-      if (e.toString().contains("not found")) {
-        // ignore for now
-      } else {
-        rethrow;
-      }
     }
   }
 
