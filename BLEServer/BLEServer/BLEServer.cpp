@@ -23,8 +23,10 @@
 #include <stdio.h>
 #include <fcntl.h>
 #include <io.h>
+#include <chrono>
 #include <mutex>
 #include <set>
+#include <thread>
 
 using namespace Platform;
 using namespace Windows::Foundation::Collections;
@@ -202,31 +204,66 @@ void writeBleState(String ^ state)
 	writeObject(msg);
 }
 
-concurrency::task<void> publishBleAdapterState(String ^ deviceId)
+concurrency::task<void> publishBleAdapterState(String ^ deviceId, int maxAttempts = 1)
 {
-	auto adapter = co_await Bluetooth::BluetoothAdapter::FromIdAsync(deviceId);
-	if (adapter == nullptr)
+	String ^ lastPublishedState = nullptr;
+	for (int attempt = 0; attempt < maxAttempts; attempt++)
 	{
-		co_return;
-	}
-
-	auto radio = co_await adapter->GetRadioAsync();
-	if (radio == nullptr)
-	{
-		co_return;
-	}
-
-	{
-		std::lock_guard<std::mutex> lock(BleAdapterMutex);
-		const std::wstring id(deviceId->Data());
-		if (presentBleAdapterIds.find(id) == presentBleAdapterIds.end())
 		{
-			co_return;
+			std::lock_guard<std::mutex> lock(BleAdapterMutex);
+			if (presentBleAdapterIds.find(std::wstring(deviceId->Data())) == presentBleAdapterIds.end())
+			{
+				co_return;
+			}
 		}
-		availableBleAdapterIds.insert(id);
-	}
 
-	writeBleState(radio->State.ToString());
+		Bluetooth::BluetoothAdapter ^ adapter = nullptr;
+		Radio ^ radio = nullptr;
+		try
+		{
+			adapter = co_await Bluetooth::BluetoothAdapter::FromIdAsync(deviceId);
+			if (adapter != nullptr)
+			{
+				radio = co_await adapter->GetRadioAsync();
+			}
+		}
+		catch (...)
+		{
+			// The device may be announced before its driver and radio are ready.
+		}
+
+		if (radio != nullptr)
+		{
+			{
+				std::lock_guard<std::mutex> lock(BleAdapterMutex);
+				const std::wstring id(deviceId->Data());
+				if (presentBleAdapterIds.find(id) == presentBleAdapterIds.end())
+				{
+					co_return;
+				}
+				availableBleAdapterIds.insert(id);
+			}
+
+			String ^ state = radio->State.ToString();
+			if (lastPublishedState == nullptr || !lastPublishedState->Equals(state))
+			{
+				writeBleState(state);
+				lastPublishedState = state;
+			}
+			if (radio->State == RadioState::On)
+			{
+				co_return;
+			}
+		}
+
+		if (attempt + 1 < maxAttempts)
+		{
+			co_await concurrency::create_task([]()
+				{
+					std::this_thread::sleep_for(std::chrono::milliseconds(500));
+				});
+		}
+	}
 }
 
 void observeBleAdapterStateTask(concurrency::task<void> operation)
@@ -275,13 +312,13 @@ void startBleAdapterWatcher()
 				std::lock_guard<std::mutex> lock(BleAdapterMutex);
 				presentBleAdapterIds.insert(std::wstring(device->Id->Data()));
 			}
-			observeBleAdapterStateTask(publishBleAdapterState(device->Id));
+			observeBleAdapterStateTask(publishBleAdapterState(device->Id, 20));
 		});
 
 	bleAdapterWatcher->Updated += ref new Windows::Foundation::TypedEventHandler<Enumeration::DeviceWatcher ^, Enumeration::DeviceInformationUpdate ^>(
 		[](Enumeration::DeviceWatcher ^ sender, Enumeration::DeviceInformationUpdate ^ device)
 		{
-			observeBleAdapterStateTask(publishBleAdapterState(device->Id));
+			observeBleAdapterStateTask(publishBleAdapterState(device->Id, 4));
 		});
 
 	bleAdapterWatcher->Removed += ref new Windows::Foundation::TypedEventHandler<Enumeration::DeviceWatcher ^, Enumeration::DeviceInformationUpdate ^>(
