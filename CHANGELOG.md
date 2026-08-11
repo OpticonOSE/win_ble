@@ -8,6 +8,10 @@
   leaving the adapter state unknown.
 - Keep a successfully opened native connection available when its initial GATT
   service discovery is empty, allowing callers to retry transient discovery.
+- Observe Windows radio state changes directly so Bluetooth on/off transitions
+  are reported without polling or restarting the helper.
+- Fail pending Dart requests when the native helper exits, is disposed, returns
+  invalid data, or stops responding instead of waiting indefinitely.
 
 - Propagate connection failures and clean up partial native device state.
 - Make disconnect cleanup idempotent when a device was not registered.

@@ -23,7 +23,9 @@
 #include <stdio.h>
 #include <fcntl.h>
 #include <io.h>
+#include <atomic>
 #include <chrono>
+#include <map>
 #include <mutex>
 #include <set>
 #include <thread>
@@ -171,14 +173,23 @@ union uint16_t_union
 };
 
 CRITICAL_SECTION OutputCriticalSection;
+std::atomic<bool> IsShuttingDown(false);
 std::mutex BleAdapterMutex;
 std::set<std::wstring> presentBleAdapterIds;
 std::set<std::wstring> availableBleAdapterIds;
+std::map<std::wstring, RadioState> bleAdapterRadioStates;
+auto bleAdapterRadios = ref new Collections::Map<String ^, Radio ^>();
+auto bleAdapterRadioStateTokens = ref new Collections::Map<String ^, Windows::Foundation::EventRegistrationToken>();
 bool bleAdapterEnumerationCompleted = false;
 Enumeration::DeviceWatcher ^ bleAdapterWatcher;
 
 void writeObject(JsonObject ^ jsonObject)
 {
+	if (IsShuttingDown.load())
+	{
+		return;
+	}
+
 	String ^ jsonString = jsonObject->Stringify();
 
 	std::wstring_convert<std::codecvt_utf8<wchar_t>> convert;
@@ -204,9 +215,135 @@ void writeBleState(String ^ state)
 	writeObject(msg);
 }
 
+void publishAggregateBleAdapterState()
+{
+	String ^ state = "Unsupported";
+	{
+		std::lock_guard<std::mutex> lock(BleAdapterMutex);
+		for (auto adapterState : bleAdapterRadioStates)
+		{
+			if (adapterState.second == RadioState::On)
+			{
+				state = "On";
+				break;
+			}
+			if (adapterState.second == RadioState::Off)
+			{
+				state = "Off";
+			}
+		}
+	}
+	writeBleState(state);
+}
+
+void observeBleRadioState(String ^ deviceId, Radio ^ radio)
+{
+	{
+		std::lock_guard<std::mutex> lock(BleAdapterMutex);
+		if (IsShuttingDown.load() || bleAdapterRadios->HasKey(deviceId))
+		{
+			return;
+		}
+	}
+
+	auto token = radio->StateChanged += ref new Windows::Foundation::TypedEventHandler<Radio ^, Platform::Object ^>(
+		[deviceId](Radio ^ sender, Platform::Object ^ args)
+		{
+			if (IsShuttingDown.load())
+			{
+				return;
+			}
+			{
+				std::lock_guard<std::mutex> lock(BleAdapterMutex);
+				const std::wstring id(deviceId->Data());
+				if (presentBleAdapterIds.find(id) == presentBleAdapterIds.end())
+				{
+					return;
+				}
+				bleAdapterRadioStates[id] = sender->State;
+			}
+			publishAggregateBleAdapterState();
+		});
+
+	bool keepObserver = false;
+	{
+		std::lock_guard<std::mutex> lock(BleAdapterMutex);
+		keepObserver = !IsShuttingDown.load()
+			&& presentBleAdapterIds.find(std::wstring(deviceId->Data())) != presentBleAdapterIds.end()
+			&& !bleAdapterRadios->HasKey(deviceId);
+		if (keepObserver)
+		{
+			bleAdapterRadios->Insert(deviceId, radio);
+			bleAdapterRadioStateTokens->Insert(deviceId, token);
+		}
+	}
+	if (!keepObserver)
+	{
+		radio->StateChanged -= token;
+	}
+}
+
+void removeBleAdapter(String ^ deviceId)
+{
+	Radio ^ radio = nullptr;
+	Windows::Foundation::EventRegistrationToken token;
+	bool hasObserver = false;
+	{
+		std::lock_guard<std::mutex> lock(BleAdapterMutex);
+		const std::wstring id(deviceId->Data());
+		presentBleAdapterIds.erase(id);
+		availableBleAdapterIds.erase(id);
+		bleAdapterRadioStates.erase(id);
+		if (bleAdapterRadios->HasKey(deviceId) && bleAdapterRadioStateTokens->HasKey(deviceId))
+		{
+			radio = bleAdapterRadios->Lookup(deviceId);
+			token = bleAdapterRadioStateTokens->Lookup(deviceId);
+			hasObserver = true;
+		}
+		if (bleAdapterRadios->HasKey(deviceId))
+		{
+			bleAdapterRadios->Remove(deviceId);
+		}
+		if (bleAdapterRadioStateTokens->HasKey(deviceId))
+		{
+			bleAdapterRadioStateTokens->Remove(deviceId);
+		}
+	}
+	if (hasObserver)
+	{
+		try
+		{
+			radio->StateChanged -= token;
+		}
+		catch (...)
+		{
+		}
+	}
+}
+
+void stopBleRadioStateObservers()
+{
+	while (true)
+	{
+		String ^ deviceId = nullptr;
+		{
+			std::lock_guard<std::mutex> lock(BleAdapterMutex);
+			for (auto adapter : bleAdapterRadios)
+			{
+				deviceId = adapter->Key;
+				break;
+			}
+		}
+		if (deviceId == nullptr)
+		{
+			return;
+		}
+		removeBleAdapter(deviceId);
+	}
+}
+
 concurrency::task<void> publishBleAdapterState(String ^ deviceId, int maxAttempts = 1)
 {
-	String ^ lastPublishedState = nullptr;
 	for (int attempt = 0; attempt < maxAttempts; attempt++)
 	{
 		{
@@ -242,18 +379,11 @@ concurrency::task<void> publishBleAdapterState(String ^ deviceId, int maxAttempt
 					co_return;
 				}
 				availableBleAdapterIds.insert(id);
+				bleAdapterRadioStates[id] = radio->State;
 			}
-
-			String ^ state = radio->State.ToString();
-			if (lastPublishedState == nullptr || !lastPublishedState->Equals(state))
-			{
-				writeBleState(state);
-				lastPublishedState = state;
-			}
-			if (radio->State == RadioState::On)
-			{
-				co_return;
-			}
+			observeBleRadioState(deviceId, radio);
+			publishAggregateBleAdapterState();
+			co_return;
 		}
 
 		if (attempt + 1 < maxAttempts)
@@ -282,22 +412,7 @@ void observeBleAdapterStateTask(concurrency::task<void> operation)
 
 void publishRemainingBleAdapterState()
 {
-	String ^ remainingId = nullptr;
-	{
-		std::lock_guard<std::mutex> lock(BleAdapterMutex);
-		if (!availableBleAdapterIds.empty())
-		{
-			remainingId = ref new String(availableBleAdapterIds.begin()->c_str());
-		}
-	}
-
-	if (remainingId == nullptr)
-	{
-		writeBleState("Unsupported");
-		return;
-	}
-
-	observeBleAdapterStateTask(publishBleAdapterState(remainingId));
+	publishAggregateBleAdapterState();
 }
 
 void startBleAdapterWatcher()
@@ -324,12 +439,7 @@ void startBleAdapterWatcher()
 	bleAdapterWatcher->Removed += ref new Windows::Foundation::TypedEventHandler<Enumeration::DeviceWatcher ^, Enumeration::DeviceInformationUpdate ^>(
 		[](Enumeration::DeviceWatcher ^ sender, Enumeration::DeviceInformationUpdate ^ device)
 		{
-			{
-				std::lock_guard<std::mutex> lock(BleAdapterMutex);
-				const std::wstring id(device->Id->Data());
-				presentBleAdapterIds.erase(id);
-				availableBleAdapterIds.erase(id);
-			}
+			removeBleAdapter(device->Id);
 			publishRemainingBleAdapterState();
 		});
 
@@ -867,7 +977,9 @@ concurrency::task<IJsonValue ^> getRadioState()
 		const std::wstring id(adapter->DeviceId->Data());
 		presentBleAdapterIds.insert(id);
 		availableBleAdapterIds.insert(id);
+		bleAdapterRadioStates[id] = radio->State;
 	}
+	observeBleRadioState(adapter->DeviceId, radio);
 
 	co_return JsonValue::CreateStringValue(radio->State.ToString());
 }
@@ -1157,11 +1269,16 @@ int main(Array<String ^> ^ args)
 		writeObject(msg);
 	}
 
+	IsShuttingDown.store(true);
+	if (bleAdvertisementWatcher != nullptr)
+	{
+		bleAdvertisementWatcher->Stop();
+	}
 	if (bleAdapterWatcher != nullptr)
 	{
 		bleAdapterWatcher->Stop();
 	}
-	DeleteCriticalSection(&OutputCriticalSection);
+	stopBleRadioStateObservers();
 
 	return 0;
 }
