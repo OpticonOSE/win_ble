@@ -671,7 +671,7 @@ concurrency::task<IJsonValue ^> unsubscribeRequest(JsonObject ^ command)
 concurrency::task<IJsonValue ^> getRadioState()
 {
 	auto radios = co_await Radio::GetRadiosAsync();
-	String ^ bleState = "";
+	String ^ bleState = "Unsupported";
 	for (Windows::Devices::Radios::Radio ^ radio : radios)
 	{
 		if (radio->Kind == RadioKind::Bluetooth)
@@ -950,9 +950,17 @@ int main(Array<String ^> ^ args)
 							writeObject(msg);
 							
 						}
-					);
+						);
+					}
 				}
-			} });
+				if (!haveBleRadio)
+				{
+					JsonObject^ msg = ref new JsonObject();
+					msg->Insert("_type", JsonValue::CreateStringValue("ble_state"));
+					msg->Insert("state", JsonValue::CreateStringValue("Unsupported"));
+					writeObject(msg);
+				}
+			});
 
 	JsonObject ^ msg = ref new JsonObject();
 	msg->Insert("_type", JsonValue::CreateStringValue("Start"));

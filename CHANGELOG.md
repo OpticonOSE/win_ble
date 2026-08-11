@@ -1,5 +1,7 @@
 ## Unreleased
 
+- Report `BleState.Unsupported` when Windows has no Bluetooth radio instead of
+  leaving the adapter state unknown.
 - Keep a successfully opened native connection available when its initial GATT
   service discovery is empty, allowing callers to retry transient discovery.
 
