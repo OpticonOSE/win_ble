@@ -23,6 +23,8 @@
 #include <stdio.h>
 #include <fcntl.h>
 #include <io.h>
+#include <mutex>
+#include <set>
 
 using namespace Platform;
 using namespace Windows::Foundation::Collections;
@@ -167,6 +169,11 @@ union uint16_t_union
 };
 
 CRITICAL_SECTION OutputCriticalSection;
+std::mutex BleAdapterMutex;
+std::set<std::wstring> presentBleAdapterIds;
+std::set<std::wstring> availableBleAdapterIds;
+bool bleAdapterEnumerationCompleted = false;
+Enumeration::DeviceWatcher ^ bleAdapterWatcher;
 
 void writeObject(JsonObject ^ jsonObject)
 {
@@ -185,6 +192,118 @@ void writeObject(JsonObject ^ jsonObject)
 
 	std::cout << stringUtf8 << std::flush;
 	LeaveCriticalSection(&OutputCriticalSection);
+}
+
+void writeBleState(String ^ state)
+{
+	JsonObject ^ msg = ref new JsonObject();
+	msg->Insert("_type", JsonValue::CreateStringValue("ble_state"));
+	msg->Insert("state", JsonValue::CreateStringValue(state));
+	writeObject(msg);
+}
+
+concurrency::task<void> publishBleAdapterState(String ^ deviceId)
+{
+	auto adapter = co_await Bluetooth::BluetoothAdapter::FromIdAsync(deviceId);
+	if (adapter == nullptr)
+	{
+		co_return;
+	}
+
+	auto radio = co_await adapter->GetRadioAsync();
+	if (radio == nullptr)
+	{
+		co_return;
+	}
+
+	{
+		std::lock_guard<std::mutex> lock(BleAdapterMutex);
+		const std::wstring id(deviceId->Data());
+		if (presentBleAdapterIds.find(id) == presentBleAdapterIds.end())
+		{
+			co_return;
+		}
+		availableBleAdapterIds.insert(id);
+	}
+
+	writeBleState(radio->State.ToString());
+}
+
+void observeBleAdapterStateTask(concurrency::task<void> operation)
+{
+	operation.then([](concurrency::task<void> completed)
+		{
+			try
+			{
+				completed.get();
+			}
+			catch (...)
+			{
+			}
+		});
+}
+
+void publishRemainingBleAdapterState()
+{
+	String ^ remainingId = nullptr;
+	{
+		std::lock_guard<std::mutex> lock(BleAdapterMutex);
+		if (!availableBleAdapterIds.empty())
+		{
+			remainingId = ref new String(availableBleAdapterIds.begin()->c_str());
+		}
+	}
+
+	if (remainingId == nullptr)
+	{
+		writeBleState("Unsupported");
+		return;
+	}
+
+	observeBleAdapterStateTask(publishBleAdapterState(remainingId));
+}
+
+void startBleAdapterWatcher()
+{
+	bleAdapterWatcher = Enumeration::DeviceInformation::CreateWatcher(
+		Bluetooth::BluetoothAdapter::GetDeviceSelector());
+
+	bleAdapterWatcher->Added += ref new Windows::Foundation::TypedEventHandler<Enumeration::DeviceWatcher ^, Enumeration::DeviceInformation ^>(
+		[](Enumeration::DeviceWatcher ^ sender, Enumeration::DeviceInformation ^ device)
+		{
+			{
+				std::lock_guard<std::mutex> lock(BleAdapterMutex);
+				presentBleAdapterIds.insert(std::wstring(device->Id->Data()));
+			}
+			observeBleAdapterStateTask(publishBleAdapterState(device->Id));
+		});
+
+	bleAdapterWatcher->Updated += ref new Windows::Foundation::TypedEventHandler<Enumeration::DeviceWatcher ^, Enumeration::DeviceInformationUpdate ^>(
+		[](Enumeration::DeviceWatcher ^ sender, Enumeration::DeviceInformationUpdate ^ device)
+		{
+			observeBleAdapterStateTask(publishBleAdapterState(device->Id));
+		});
+
+	bleAdapterWatcher->Removed += ref new Windows::Foundation::TypedEventHandler<Enumeration::DeviceWatcher ^, Enumeration::DeviceInformationUpdate ^>(
+		[](Enumeration::DeviceWatcher ^ sender, Enumeration::DeviceInformationUpdate ^ device)
+		{
+			{
+				std::lock_guard<std::mutex> lock(BleAdapterMutex);
+				const std::wstring id(device->Id->Data());
+				presentBleAdapterIds.erase(id);
+				availableBleAdapterIds.erase(id);
+			}
+			publishRemainingBleAdapterState();
+		});
+
+	bleAdapterWatcher->EnumerationCompleted += ref new Windows::Foundation::TypedEventHandler<Enumeration::DeviceWatcher ^, Platform::Object ^>(
+		[](Enumeration::DeviceWatcher ^ sender, Platform::Object ^ args)
+		{
+			std::lock_guard<std::mutex> lock(BleAdapterMutex);
+			bleAdapterEnumerationCompleted = true;
+		});
+
+	bleAdapterWatcher->Start();
 }
 
 concurrency::task<IJsonValue ^> connectRequest(JsonObject ^ command)
@@ -670,7 +789,31 @@ concurrency::task<IJsonValue ^> unsubscribeRequest(JsonObject ^ command)
 
 concurrency::task<IJsonValue ^> getRadioState()
 {
-	auto adapter = co_await Bluetooth::BluetoothAdapter::GetDefaultAsync();
+	String ^ watchedAdapterId = nullptr;
+	bool useWatchedAdapters = false;
+	{
+		std::lock_guard<std::mutex> lock(BleAdapterMutex);
+		useWatchedAdapters = bleAdapterEnumerationCompleted;
+		if (useWatchedAdapters && !availableBleAdapterIds.empty())
+		{
+			watchedAdapterId = ref new String(availableBleAdapterIds.begin()->c_str());
+		}
+	}
+
+	if (useWatchedAdapters && watchedAdapterId == nullptr)
+	{
+		co_return JsonValue::CreateStringValue("Unsupported");
+	}
+
+	Bluetooth::BluetoothAdapter ^ adapter = nullptr;
+	if (watchedAdapterId == nullptr)
+	{
+		adapter = co_await Bluetooth::BluetoothAdapter::GetDefaultAsync();
+	}
+	else
+	{
+		adapter = co_await Bluetooth::BluetoothAdapter::FromIdAsync(watchedAdapterId);
+	}
 	if (adapter == nullptr)
 	{
 		co_return JsonValue::CreateStringValue("Unsupported");
@@ -680,6 +823,13 @@ concurrency::task<IJsonValue ^> getRadioState()
 	if (radio == nullptr)
 	{
 		co_return JsonValue::CreateStringValue("Unsupported");
+	}
+
+	{
+		std::lock_guard<std::mutex> lock(BleAdapterMutex);
+		const std::wstring id(adapter->DeviceId->Data());
+		presentBleAdapterIds.insert(id);
+		availableBleAdapterIds.insert(id);
 	}
 
 	co_return JsonValue::CreateStringValue(radio->State.ToString());
@@ -929,6 +1079,8 @@ int main(Array<String ^> ^ args)
 			writeObject(msg);
 		});
 
+	startBleAdapterWatcher();
+
 	JsonObject ^ msg = ref new JsonObject();
 	msg->Insert("_type", JsonValue::CreateStringValue("Start"));
 	writeObject(msg);
@@ -968,6 +1120,10 @@ int main(Array<String ^> ^ args)
 		writeObject(msg);
 	}
 
+	if (bleAdapterWatcher != nullptr)
+	{
+		bleAdapterWatcher->Stop();
+	}
 	DeleteCriticalSection(&OutputCriticalSection);
 
 	return 0;

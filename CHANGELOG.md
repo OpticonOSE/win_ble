@@ -1,5 +1,7 @@
 ## Unreleased
 
+- Watch Windows Bluetooth adapter devices so physical USB insertion and
+  removal emit live BLE availability changes without restarting the helper.
 - Query the default Bluetooth adapter directly and avoid concurrent radio
   enumeration that could stall state detection on multi-adapter systems.
 - Report `BleState.Unsupported` when Windows has no Bluetooth radio instead of
