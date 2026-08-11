@@ -1,5 +1,7 @@
 ## Unreleased
 
+- Query the default Bluetooth adapter directly and avoid concurrent radio
+  enumeration that could stall state detection on multi-adapter systems.
 - Report `BleState.Unsupported` when Windows has no Bluetooth radio instead of
   leaving the adapter state unknown.
 - Keep a successfully opened native connection available when its initial GATT

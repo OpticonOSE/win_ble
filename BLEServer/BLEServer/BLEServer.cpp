@@ -670,16 +670,19 @@ concurrency::task<IJsonValue ^> unsubscribeRequest(JsonObject ^ command)
 
 concurrency::task<IJsonValue ^> getRadioState()
 {
-	auto radios = co_await Radio::GetRadiosAsync();
-	String ^ bleState = "Unsupported";
-	for (Windows::Devices::Radios::Radio ^ radio : radios)
+	auto adapter = co_await Bluetooth::BluetoothAdapter::GetDefaultAsync();
+	if (adapter == nullptr)
 	{
-		if (radio->Kind == RadioKind::Bluetooth)
-		{
-			bleState = radio->State.ToString();
-		}
+		co_return JsonValue::CreateStringValue("Unsupported");
 	}
-	co_return JsonValue::CreateStringValue(bleState);
+
+	auto radio = co_await adapter->GetRadioAsync();
+	if (radio == nullptr)
+	{
+		co_return JsonValue::CreateStringValue("Unsupported");
+	}
+
+	co_return JsonValue::CreateStringValue(radio->State.ToString());
 }
 
 concurrency::task<IJsonValue ^> changeRadioState(JsonObject ^ command)
@@ -925,42 +928,6 @@ int main(Array<String ^> ^ args)
 			// TODO manfuacturer data / flags / data sections ?
 			writeObject(msg);
 		});
-
-	// Added the ability to track the BLE Radio State
-	auto getRadiosOperation = Radio::GetRadiosAsync();
-	create_task(getRadiosOperation).then([](task<IVectorView<Radio ^> ^> asyncInfo)
-										 {
-			auto radios = asyncInfo.get();
-			boolean haveBleRadio = false;
-			for (Windows::Devices::Radios::Radio^ radio : radios)
-			{
-				if (radio->Kind == RadioKind::Bluetooth)
-				{
-					haveBleRadio = true;
-					JsonObject^ msg = ref new JsonObject();
-					msg->Insert("_type", JsonValue::CreateStringValue("ble_state"));
-					msg->Insert("state", JsonValue::CreateStringValue(radio->State.ToString()));
-					writeObject(msg);
-					radio->StateChanged += ref new Windows::Foundation::TypedEventHandler<Windows::Devices::Radios::Radio^, Platform::Object^>(
-						[](Windows::Devices::Radios::Radio^ sender, Platform::Object^ args)
-						{
-							JsonObject^ msg = ref new JsonObject();
-							msg->Insert("_type", JsonValue::CreateStringValue("ble_state"));
-							msg->Insert("state", JsonValue::CreateStringValue(sender->State.ToString()));
-							writeObject(msg);
-							
-						}
-						);
-					}
-				}
-				if (!haveBleRadio)
-				{
-					JsonObject^ msg = ref new JsonObject();
-					msg->Insert("_type", JsonValue::CreateStringValue("ble_state"));
-					msg->Insert("state", JsonValue::CreateStringValue("Unsupported"));
-					writeObject(msg);
-				}
-			});
 
 	JsonObject ^ msg = ref new JsonObject();
 	msg->Insert("_type", JsonValue::CreateStringValue("Start"));
